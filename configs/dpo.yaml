@@ -1,0 +1,52 @@
+model:
+  name: Qwen/Qwen3-1.7B
+  trust_remote_code: true
+  sft_adapter_path: models/qwen3-1.7b-nemotron-safety-sft-lora
+
+dataset:
+  name: nvidia/Nemotron-RL-Safety-v1
+  split: train
+  val_size: 0.02
+  max_train_samples: null
+  num_proc: 1
+
+training:
+  output_dir: models/qwen3-1.7b-nemotron-safety-dpo-lora
+
+  max_seq_length: 4096
+
+  num_train_epochs: 1.0
+  learning_rate: 5.0e-6
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 16
+  warmup_ratio: 0.03
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+
+  logging_steps: 10
+  eval_steps: 250
+  save_steps: 250
+  save_total_limit: 3
+  seed: 42
+
+  beta: 0.1
+  loss_type: sigmoid
+
+  push_to_hub: false
+  hub_model_id: null
+
+wandb:
+  enabled: true
+  project: qwen3-safety
+  entity: null
+  name: qwen3-1.7b-nemotron-safety-dpo-lora
+  tags:
+    - qwen3
+    - dpo
+    - safety
+  log_model: false
+
+hydra:
+  run:
+    dir: .
