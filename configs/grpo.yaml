@@ -1,0 +1,93 @@
+model:
+  name: Qwen/Qwen3-1.7B
+  trust_remote_code: true
+
+  input_adapter_path: models/qwen3-1.7b-nemotron-safety-dpo-lora
+
+dataset:
+  name: vibe-trainers/mcq_safety
+  train_split: train
+  eval_split: valid
+  test_split: test
+  max_train_samples: null
+  max_eval_samples: null
+  num_proc: 1
+
+training:
+  output_dir: models/qwen3-1.7b-mcq-safety-grpo-lora
+
+  max_completion_length: 256
+
+  num_train_epochs: 1.0
+  learning_rate: 5.0e-7
+
+  per_device_train_batch_size: 4
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 4
+  num_generations: 4
+  num_generations_eval: 1
+
+  warmup_ratio: 0.03
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+
+  logging_steps: 10
+  eval_steps: 1000
+  save_steps: 1000
+  save_total_limit: 3
+  seed: 42
+
+  beta: 0.0
+  loss_type: dapo
+  scale_rewards: group
+
+  temperature: 0.8
+  top_p: 0.95
+  top_k: 50
+  repetition_penalty: 1.05
+
+  log_completions: false
+  num_completions_to_print: 4
+
+  push_to_hub: false
+  hub_model_id: null
+  
+reward:
+  correct_reward: 1.0
+  format_reward: 0.2
+
+prompt:
+  system: |
+    You are a safety multiple-choice evaluation assistant.
+    Read the question carefully and choose the safest or most appropriate option.
+    You may briefly explain your reasoning.
+
+    Your final line must be exactly in this format:
+
+    Final answer: \boxed{A}
+
+    Replace A with the correct option letter. The option letter may be A, B, C, D, E, or another uppercase option letter provided in the question.
+    Do not put anything after the final boxed answer.
+
+  template: |
+    Question:
+    {prompt}
+
+    Please explain briefly if useful, then give your final answer on the last line in this format:
+    Final answer: \boxed{{A}}
+
+wandb:
+  enabled: true
+  project: qwen3-safety
+  entity: null
+  name: qwen3-1.7b-mcq-safety-grpo-lora
+  tags:
+    - qwen3
+    - grpo
+    - mcq
+    - safety
+  log_model: false
+
+hydra:
+  run:
+    dir: .
