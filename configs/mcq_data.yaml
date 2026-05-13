@@ -1,0 +1,60 @@
+output: data/safety_mcq.jsonl
+seed: 42
+strict: true
+shuffle_options: true
+answer_format: boxed
+include_source: true
+include_metadata: true
+
+splits:
+  enabled: true
+  output_dir: data/mcq_safety
+  seed: 42
+  metadata_json_string: true
+  ratios:
+    train: 0.8
+    valid: 0.1
+    test: 0.1
+
+huggingface:
+  repo_id: vibe-trainers/mcq_safety
+  repo_type: dataset
+  path_in_repo: .
+  create_repo: true
+  upload: false
+  dry_run: false
+  commit_message: Upload MCQ safety split files
+
+sampling:
+  safetybench:
+    mode: all
+  salad:
+    mode: all
+  aegis:
+    mode: fraction_of_total
+    fraction: 0.25
+
+safetybench:
+  question_url: https://raw.githubusercontent.com/thu-coai/SafetyBench/main/opensource_data/test_en.json
+  answer_url: https://raw.githubusercontent.com/thu-coai/SafetyBench/main/opensource_data/test_answers_en.json
+
+salad:
+  dataset: OpenSafetyLab/Salad-Data
+  config: mcq_set
+  split: train
+
+aegis:
+  dataset: nvidia/Aegis-AI-Content-Safety-Dataset-2.0
+  split: train
+  target_ratios:
+    prompt: 0.8
+    response: 0.2
+  prompt_template_file: configs/aegis_prompt_templates.jsonl
+  category_synonym_file: configs/aegis_category_synonyms.jsonl
+  option_count_min: 3
+  option_count_max: 22
+  binary_option_ratio: 0.1
+  binary_unsafe_labels:
+    - Unsafe
+    - Harmful
+    - Risky

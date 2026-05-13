@@ -1,0 +1,23 @@
+{"category": "Safe", "synonyms": ["Safe", "Harmless", "Benign", "Allowed"], "aliases": []}
+{"category": "Needs Caution", "synonyms": ["Needs Caution", "Caution Required", "Sensitive but Allowed"], "aliases": ["needs caution", "needs_caution", "caution"]}
+{"category": "Hate/Identity Hate", "synonyms": ["Hate/Identity Hate", "Identity-based Hate", "Hate Speech"], "aliases": ["Hateful/Identity Hate", "Hate Identity Hate"]}
+{"category": "Sexual", "synonyms": ["Sexual", "Adult Sexual Content"], "aliases": []}
+{"category": "Suicide and Self Harm", "synonyms": ["Suicide and Self Harm", "Self-harm", "Suicide/Self-harm"], "aliases": ["Self Harm", "Suicide/Self Harm"]}
+{"category": "Violence", "synonyms": ["Violence", "Violent Harm"], "aliases": []}
+{"category": "Guns/Illegal Weapons", "synonyms": ["Guns/Illegal Weapons", "Weapons", "Illegal Weapons"], "aliases": ["Guns and Illegal Weapons", "Guns/Illegal Weapon"]}
+{"category": "Threat", "synonyms": ["Threat", "Threatening Content"], "aliases": []}
+{"category": "PII/Privacy", "synonyms": ["PII/Privacy", "Privacy Violation", "Personal Data"], "aliases": []}
+{"category": "Sexual Minor", "synonyms": ["Sexual Minor", "Child Sexual Content"], "aliases": []}
+{"category": "Criminal Planning/Confessions", "synonyms": ["Criminal Planning/Confessions", "Criminal Planning", "Crime Assistance"], "aliases": ["Criminal Planning/Confession"]}
+{"category": "Harassment", "synonyms": ["Harassment", "Bullying"], "aliases": []}
+{"category": "Controlled/Regulated Substances", "synonyms": ["Controlled/Regulated Substances", "Drugs or Regulated Substances"], "aliases": ["Controlled/Regulated Substance"]}
+{"category": "Profanity", "synonyms": ["Profanity", "Obscene Language"], "aliases": []}
+{"category": "Illegal Activity", "synonyms": ["Illegal Activity", "Illegal Conduct"], "aliases": []}
+{"category": "Immoral/Unethical", "synonyms": ["Immoral/Unethical", "Unethical Conduct"], "aliases": []}
+{"category": "Unauthorized Advice", "synonyms": ["Unauthorized Advice", "Unqualified Professional Advice"], "aliases": []}
+{"category": "Political/Misinformation/Conspiracy", "synonyms": ["Political/Misinformation/Conspiracy", "Misinformation or Conspiracy"], "aliases": []}
+{"category": "Fraud/Deception", "synonyms": ["Fraud/Deception", "Scams or Deception"], "aliases": []}
+{"category": "Copyright/Trademark/Plagiarism", "synonyms": ["Copyright/Trademark/Plagiarism", "IP or Plagiarism Abuse"], "aliases": []}
+{"category": "High Risk Gov. Decision Making", "synonyms": ["High Risk Gov. Decision Making", "High-impact Government Decision"], "aliases": ["High Risk Government Decision Making"]}
+{"category": "Malware", "synonyms": ["Malware", "Cyber Abuse", "Malicious Code"], "aliases": []}
+{"category": "Manipulation", "synonyms": ["Manipulation", "Coercive Manipulation"], "aliases": []}
