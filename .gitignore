@@ -3,3 +3,5 @@
 .hydra/
 models/
 data/
+eval_outputs/
+__pycache__/

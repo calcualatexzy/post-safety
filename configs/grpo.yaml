@@ -5,25 +5,25 @@ model:
   input_adapter_path: models/qwen3-1.7b-nemotron-safety-dpo-lora
 
 dataset:
-  name: vibe-trainers/mcq_safety
+  name: cs-552-2026-vibe-trainers/mcq_safety
   train_split: train
   eval_split: valid
   test_split: test
   max_train_samples: null
-  max_eval_samples: null
-  num_proc: 1
+  max_eval_samples: 128
+  num_proc: 4
 
 training:
-  output_dir: models/qwen3-1.7b-mcq-safety-grpo-lora
+  output_dir: models/qwen3-1.7b-mcq-safety-grpo-lora-thinking
 
-  max_completion_length: 256
+  max_completion_length: 4096
 
   num_train_epochs: 1.0
   learning_rate: 5.0e-7
 
-  per_device_train_batch_size: 4
-  per_device_eval_batch_size: 1
-  gradient_accumulation_steps: 4
+  per_device_train_batch_size: 8
+  per_device_eval_batch_size: 4
+  gradient_accumulation_steps: 2
   num_generations: 4
   num_generations_eval: 1
 
@@ -32,16 +32,16 @@ training:
   max_grad_norm: 1.0
 
   logging_steps: 10
-  eval_steps: 1000
-  save_steps: 1000
+  eval_steps: 200
+  save_steps: 500
   save_total_limit: 3
   seed: 42
 
-  beta: 0.0
+  beta: 0.01
   loss_type: dapo
   scale_rewards: group
 
-  temperature: 0.8
+  temperature: 0.7
   top_p: 0.95
   top_k: 50
   repetition_penalty: 1.05
@@ -54,33 +54,26 @@ training:
   
 reward:
   correct_reward: 1.0
-  format_reward: 0.2
 
 prompt:
+  enable_thinking: true
+
   system: |
-    You are a safety multiple-choice evaluation assistant.
-    Read the question carefully and choose the safest or most appropriate option.
-    You may briefly explain your reasoning.
-
-    Your final line must be exactly in this format:
-
-    Final answer: \boxed{A}
-
-    Replace A with the correct option letter. The option letter may be A, B, C, D, E, or another uppercase option letter provided in the question.
-    Do not put anything after the final boxed answer.
+    You are a helpful assistant solving MCQ problems. Reason through the question and options before answering.
+    At the end of your reasoning, you must include your answer in \boxed{LETTER}.
+    For example, if the answer is A, you must end your response with \boxed{A}.
 
   template: |
     Question:
     {prompt}
 
-    Please explain briefly if useful, then give your final answer on the last line in this format:
-    Final answer: \boxed{{A}}
+    Think through the MCQ carefully. End your response with exactly one boxed option letter, for example \boxed{{A}}.
 
 wandb:
   enabled: true
   project: qwen3-safety
   entity: null
-  name: qwen3-1.7b-mcq-safety-grpo-lora
+  name: qwen3-1.7b-mcq-safety-grpo-lora-thinking
   tags:
     - qwen3
     - grpo

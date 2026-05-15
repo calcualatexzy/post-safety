@@ -104,7 +104,10 @@ def extract_boxed_letter(text: Any) -> str:
 
     text = str(text).strip().upper()
 
-    match = re.search(r"\\BOXED\{([A-Z])\}", text)
+    if re.fullmatch(r"[A-Z]+", text):
+        return text
+
+    match = re.search(r"\\BOXED\{\s*([A-Z]+)\s*\}", text)
     if match:
         return match.group(1)
 
@@ -141,77 +144,53 @@ def completion_to_text(completion: Any) -> str:
     return str(completion)
 
 
-def extract_pred_letter(completion: Any) -> tuple[str, bool]:
-    """
-    Return:
-        pred_letter: extracted A-Z option letter
-        strict_format_ok: whether final non-empty line exactly matches:
-            Final answer: \\boxed{X}
-    """
+def final_response_text(completion: Any) -> str:
+    """Return only the visible final answer text, excluding Qwen thinking blocks."""
+
     text = completion_to_text(completion).strip()
-    text_upper = text.upper()
+    if not text:
+        return ""
 
-    nonempty_lines = [line.strip() for line in text.splitlines() if line.strip()]
-    last_line = nonempty_lines[-1] if nonempty_lines else ""
+    think_close_matches = list(re.finditer(r"</think\s*>", text, flags=re.IGNORECASE))
+    if think_close_matches:
+        return text[think_close_matches[-1].end() :].strip()
 
-    strict_match = re.match(
-        r"^Final answer:\s*\\boxed\{([A-Z])\}\s*$",
-        last_line,
-        flags=re.IGNORECASE,
-    )
+    if re.search(r"<think\b", text, flags=re.IGNORECASE):
+        # If the model never closes its thinking block, it has not produced a
+        # final response that should be scored.
+        return ""
 
-    if strict_match:
-        return strict_match.group(1).upper(), True
+    return text
 
-    match = re.search(
-        r"Final answer:\s*\\boxed\{([A-Z])\}",
-        text,
-        flags=re.IGNORECASE,
-    )
-    if match:
-        return match.group(1).upper(), False
 
+def extract_pred_letter(completion: Any) -> str:
+    """Extract the final boxed MCQ option from the model's final response."""
+
+    text = final_response_text(completion)
     boxed_matches = re.findall(
-        r"\\boxed\{([A-Z])\}",
+        r"\\boxed\{\s*([A-Z]+)\s*\}",
         text,
         flags=re.IGNORECASE,
     )
     if boxed_matches:
-        return boxed_matches[-1].upper(), False
+        return boxed_matches[-1].upper()
 
-    match = re.search(
-        r"Final answer:\s*([A-Z])\b",
-        text_upper,
-        flags=re.IGNORECASE,
-    )
-    if match:
-        return match.group(1).upper(), False
-
-    standalone_letters = re.findall(r"\b([A-Z])\b", text_upper)
-    if standalone_letters:
-        return standalone_letters[-1].upper(), False
-
-    return "", False
+    return ""
 
 
-def make_mcq_reward_func(correct_reward: float, format_reward: float):
-    def mcq_boxed_reward(
+def make_mcq_reward_func(correct_reward: float):
+    def mcq_accuracy_reward(
         prompts: List[Any],
         completions: List[Any],
         answer: List[Any] | Any = None,
         **kwargs,
     ) -> List[float]:
         """
-        Reward:
-            + correct_reward if extracted final answer matches gold
-            + format_reward if final line exactly matches:
-                Final answer: \\boxed{X}
+        Default MCQ accuracy reward.
 
-        Expected reward values:
-            correct + strict format: 1.2
-            correct but imperfect format: 1.0
-            wrong but strict format: 0.2
-            wrong and bad format: 0.0
+        The model is allowed to think, but only the final response after any
+        Qwen ``</think>`` block is scored. A completion receives reward only
+        when the final response contains a boxed option matching the gold label.
         """
         if answer is None:
             answer = kwargs.get("answers", None)
@@ -237,11 +216,10 @@ def make_mcq_reward_func(correct_reward: float, format_reward: float):
         rewards = []
 
         correct_count = 0
-        strict_format_count = 0
 
         for completion, gold_answer in zip(completions, answers):
             gold = extract_boxed_letter(gold_answer)
-            pred, strict_format_ok = extract_pred_letter(completion)
+            pred = extract_pred_letter(completion)
 
             reward = 0.0
 
@@ -249,16 +227,12 @@ def make_mcq_reward_func(correct_reward: float, format_reward: float):
                 reward += float(correct_reward)
                 correct_count += 1
 
-            if strict_format_ok:
-                reward += float(format_reward)
-                strict_format_count += 1
-
             rewards.append(reward)
 
         return rewards
 
-    mcq_boxed_reward.__name__ = "mcq_boxed_reward"
-    return mcq_boxed_reward
+    mcq_accuracy_reward.__name__ = "mcq_accuracy_reward"
+    return mcq_accuracy_reward
 
 
 def valid_raw_example(example: Dict[str, Any]) -> bool:
@@ -273,7 +247,7 @@ def valid_raw_example(example: Dict[str, Any]) -> bool:
         return False
 
     gold = extract_boxed_letter(answer)
-    return len(gold) == 1
+    return len(gold) > 0
 
 
 def build_grpo_example(example: Dict[str, Any], tokenizer, cfg: DictConfig) -> Dict[str, str]:
@@ -294,7 +268,7 @@ def build_grpo_example(example: Dict[str, Any], tokenizer, cfg: DictConfig) -> D
         messages,
         tokenize=False,
         add_generation_prompt=True,
-        enable_thinking=False,
+        enable_thinking=bool(cfg.prompt.enable_thinking),
     )
 
     return {
@@ -467,10 +441,7 @@ def main(cfg: DictConfig):
 
     model = load_policy_model(cfg, dtype=dtype)
 
-    reward_func = make_mcq_reward_func(
-        correct_reward=float(cfg.reward.correct_reward),
-        format_reward=float(cfg.reward.format_reward),
-    )
+    reward_func = make_mcq_reward_func(correct_reward=float(cfg.reward.correct_reward))
 
     generation_kwargs = {
         "repetition_penalty": float(cfg.training.repetition_penalty),

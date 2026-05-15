@@ -11,26 +11,34 @@ splits:
   output_dir: data/mcq_safety
   seed: 42
   metadata_json_string: true
+  stratify_by_source: true
   ratios:
-    train: 0.8
-    valid: 0.1
-    test: 0.1
+    train: 0.9
+    valid: 0.05
+    test: 0.05
 
 huggingface:
-  repo_id: vibe-trainers/mcq_safety
+  repo_id: cs-552-2026-vibe-trainers/mcq_safety
   repo_type: dataset
   path_in_repo: .
   create_repo: true
-  upload: false
+  upload: true
   dry_run: false
   commit_message: Upload MCQ safety split files
+
+quality:
+  deduplicate_prompts: true
+  drop_conflicting_prompts: true
+  require_unique_options: true
+  min_options: 2
+  max_options: 26
 
 sampling:
   safetybench:
     mode: all
   salad:
     mode: all
-  aegis:
+  wildguard:
     mode: fraction_of_total
     fraction: 0.25
 
@@ -43,17 +51,21 @@ salad:
   config: mcq_set
   split: train
 
-aegis:
-  dataset: nvidia/Aegis-AI-Content-Safety-Dataset-2.0
+wildguard:
+  dataset: allenai/wildguardmix
+  config: wildguardtrain
   split: train
   target_ratios:
-    prompt: 0.8
-    response: 0.2
-  prompt_template_file: configs/aegis_prompt_templates.jsonl
-  category_synonym_file: configs/aegis_category_synonyms.jsonl
-  option_count_min: 3
-  option_count_max: 22
-  binary_option_ratio: 0.1
+    prompt: 0.75
+    response: 0.25
+  prompt_template_file: configs/wildguard_prompt_templates.jsonl
+  category_synonym_file: null
+  option_count_min: 4
+  option_count_typical_max: 6
+  option_count_max: 15
+  large_option_ratio: 0.08
+  binary_option_ratio: 0.05
+  hard_distractor_ratio: 0.65
   binary_unsafe_labels:
     - Unsafe
     - Harmful

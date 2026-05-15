@@ -24,7 +24,7 @@ import random
 import re
 import sys
 import urllib.request
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -46,36 +46,61 @@ SALAD_DATASET = "OpenSafetyLab/Salad-Data"
 SALAD_CONFIG = "mcq_set"
 SALAD_SPLIT = "train"
 
-AEGIS_DATASET = "nvidia/Aegis-AI-Content-Safety-Dataset-2.0"
-AEGIS_SPLIT = "train"
+WILDGUARD_DATASET = "allenai/wildguardmix"
+WILDGUARD_CONFIG = "wildguardtrain"
+WILDGUARD_SPLIT = "train"
 
-# Aegis/Nemotron safety taxonomy options.  This intentionally includes more
-# than 15 choices because Aegis 2.0 is used as a harm-category classification
-# task, not a fixed four-choice task.
-AEGIS_TAXONOMY = [
+# WildGuardMix prompt harm subcategories plus a safe class. The source stores
+# these as snake-case subcategory ids, and the MCQ renders reader-friendly
+# labels with a few synonyms below.
+WILDGUARD_TAXONOMY = [
     "Safe",
-    "Needs Caution",
-    "Hate/Identity Hate",
-    "Sexual",
-    "Suicide and Self Harm",
-    "Violence",
-    "Guns/Illegal Weapons",
-    "Threat",
-    "PII/Privacy",
-    "Sexual Minor",
-    "Criminal Planning/Confessions",
-    "Harassment",
-    "Controlled/Regulated Substances",
-    "Profanity",
-    "Illegal Activity",
-    "Immoral/Unethical",
-    "Unauthorized Advice",
-    "Political/Misinformation/Conspiracy",
-    "Fraud/Deception",
-    "Copyright/Trademark/Plagiarism",
-    "High Risk Gov. Decision Making",
-    "Malware",
-    "Manipulation",
+    "Other Harm",
+    "Social Stereotypes and Unfair Discrimination",
+    "False or Misleading Information/Disinformation Campaigns",
+    "Sensitive Information (Organization/Government)",
+    "Toxic Language/Hate Speech",
+    "Violence and Physical Harm",
+    "Private Information (Individual)",
+    "Defamation/Unethical or Unsafe Actions",
+    "Fraud/Assisting Illegal Activities",
+    "Sexual Content",
+    "Mental Health/Over-Reliance Crisis",
+    "Copyright Violations",
+    "Cyberattack",
+    "Material Harm by Misinformation",
+]
+
+WILDGUARD_SUBCATEGORY_MAP = {
+    "benign": "Safe",
+    "others": "Other Harm",
+    "social_stereotypes_and_unfair_discrimination": "Social Stereotypes and Unfair Discrimination",
+    "disseminating_false_or_misleading_information_encouraging_disinformation_campaigns": "False or Misleading Information/Disinformation Campaigns",
+    "sensitive_information_organization_government": "Sensitive Information (Organization/Government)",
+    "toxic_language_hate_speech": "Toxic Language/Hate Speech",
+    "violence_and_physical_harm": "Violence and Physical Harm",
+    "private_information_individual": "Private Information (Individual)",
+    "defamation_encouraging_unethical_or_unsafe_actions": "Defamation/Unethical or Unsafe Actions",
+    "fraud_assisting_illegal_activities": "Fraud/Assisting Illegal Activities",
+    "sexual_content": "Sexual Content",
+    "mental_health_over-reliance_crisis": "Mental Health/Over-Reliance Crisis",
+    "copyright_violations": "Copyright Violations",
+    "cyberattack": "Cyberattack",
+    "causing_material_harm_by_disseminating_misinformation": "Material Harm by Misinformation",
+}
+
+# Distractors are sampled from nearby categories first so WildGuard-derived
+# MCQs are less often solved by spotting one obviously unrelated option.
+WILDGUARD_DISTRACTOR_GROUPS = [
+    ("Safe", "Other Harm"),
+    ("False or Misleading Information/Disinformation Campaigns", "Material Harm by Misinformation"),
+    ("Social Stereotypes and Unfair Discrimination", "Toxic Language/Hate Speech", "Defamation/Unethical or Unsafe Actions"),
+    ("Violence and Physical Harm", "Fraud/Assisting Illegal Activities", "Defamation/Unethical or Unsafe Actions"),
+    ("Private Information (Individual)", "Sensitive Information (Organization/Government)", "Fraud/Assisting Illegal Activities"),
+    ("Cyberattack", "Fraud/Assisting Illegal Activities", "Sensitive Information (Organization/Government)"),
+    ("Mental Health/Over-Reliance Crisis", "Defamation/Unethical or Unsafe Actions", "Other Harm"),
+    ("Copyright Violations", "Fraud/Assisting Illegal Activities", "Other Harm"),
+    ("Sexual Content", "Other Harm"),
 ]
 
 
@@ -190,7 +215,7 @@ def require_datasets():
         from datasets import load_dataset
     except ImportError as exc:
         raise RuntimeError(
-            "The `datasets` package is required for SALAD and Aegis downloads. "
+            "The `datasets` package is required for SALAD and WildGuard downloads. "
             "Install it with `pip install datasets`."
         ) from exc
     return load_dataset
@@ -267,7 +292,7 @@ def normalize_prompt_templates(value: Any) -> dict[str, list[str]]:
     if value is None:
         return templates
     if not isinstance(value, dict):
-        raise ValueError("aegis.prompt_templates must be a mapping")
+        raise ValueError("wildguard.prompt_templates must be a mapping")
 
     for target in ("prompt", "response", "both"):
         if target not in value:
@@ -276,9 +301,9 @@ def normalize_prompt_templates(value: Any) -> dict[str, list[str]]:
         if isinstance(target_templates, str):
             target_templates = [target_templates]
         if not isinstance(target_templates, list) or not target_templates:
-            raise ValueError(f"aegis.prompt_templates.{target} must be a non-empty list")
+            raise ValueError(f"wildguard.prompt_templates.{target} must be a non-empty list")
         if not all(isinstance(template, str) and template.strip() for template in target_templates):
-            raise ValueError(f"aegis.prompt_templates.{target} contains an invalid template")
+            raise ValueError(f"wildguard.prompt_templates.{target} contains an invalid template")
         templates[target] = target_templates
     return templates
 
@@ -309,23 +334,23 @@ def require_template_targets(
 
 
 def normalize_category_synonyms(value: Any) -> tuple[dict[str, list[str]], dict[str, str]]:
-    synonyms: dict[str, list[str]] = {}
-    aliases = {canonical_category(label): label for label in AEGIS_TAXONOMY}
+    synonyms: dict[str, list[str]] = {label: [label] for label in WILDGUARD_TAXONOMY}
+    aliases = {canonical_category(label): label for label in WILDGUARD_TAXONOMY}
     if value is None:
         return synonyms, aliases
     if not isinstance(value, dict):
-        raise ValueError("aegis.category_synonyms must be a mapping")
+        raise ValueError("wildguard.category_synonyms must be a mapping")
 
     for category, category_synonyms in value.items():
-        if category not in AEGIS_TAXONOMY:
+        if category not in WILDGUARD_TAXONOMY:
             continue
         if isinstance(category_synonyms, str):
             category_synonyms = [category_synonyms]
         if not isinstance(category_synonyms, list) or not category_synonyms:
-            raise ValueError(f"aegis.category_synonyms.{category} must be a non-empty list")
+            raise ValueError(f"wildguard.category_synonyms.{category} must be a non-empty list")
         clean = [str(item).strip() for item in category_synonyms if str(item).strip()]
         if not clean:
-            raise ValueError(f"aegis.category_synonyms.{category} must contain text labels")
+            raise ValueError(f"wildguard.category_synonyms.{category} must contain text labels")
         if category not in clean:
             clean.insert(0, category)
         synonyms[category] = clean
@@ -336,11 +361,11 @@ def normalize_category_synonyms(value: Any) -> tuple[dict[str, list[str]], dict[
 
 def load_category_synonym_jsonl(path: Path) -> tuple[dict[str, list[str]], dict[str, str]]:
     synonyms: dict[str, list[str]] = {}
-    aliases = {canonical_category(label): label for label in AEGIS_TAXONOMY}
+    aliases = {canonical_category(label): label for label in WILDGUARD_TAXONOMY}
     for record in load_jsonl(path):
         category = str(record.get("category", "")).strip()
-        if category not in AEGIS_TAXONOMY:
-            raise ValueError(f"{path}: unknown Aegis category {category!r}")
+        if category not in WILDGUARD_TAXONOMY:
+            raise ValueError(f"{path}: unknown WildGuard category {category!r}")
         raw_synonyms = record.get("synonyms")
         if isinstance(raw_synonyms, str):
             raw_synonyms = [raw_synonyms]
@@ -363,9 +388,9 @@ def load_category_synonym_jsonl(path: Path) -> tuple[dict[str, list[str]], dict[
             if text:
                 aliases[canonical_category(text)] = category
 
-    missing = [category for category in AEGIS_TAXONOMY if category not in synonyms]
+    missing = [category for category in WILDGUARD_TAXONOMY if category not in synonyms]
     if missing:
-        raise ValueError(f"{path}: missing synonyms for Aegis categories: {missing}")
+        raise ValueError(f"{path}: missing synonyms for WildGuard categories: {missing}")
     return synonyms, aliases
 
 
@@ -373,20 +398,20 @@ def normalize_target_ratios(value: Any, *, default_target: str) -> dict[str, flo
     if value is None:
         return {default_target: 1.0}
     if not isinstance(value, dict):
-        raise ValueError("aegis.target_ratios must be a mapping")
+        raise ValueError("wildguard.target_ratios must be a mapping")
 
     ratios = {}
     for target, ratio in value.items():
         target = str(target).strip()
         if target not in {"prompt", "response", "both"}:
-            raise ValueError(f"invalid Aegis target ratio key: {target!r}")
+            raise ValueError(f"invalid WildGuard target ratio key: {target!r}")
         ratio = float(ratio)
         if ratio < 0:
-            raise ValueError("aegis.target_ratios values must be non-negative")
+            raise ValueError("wildguard.target_ratios values must be non-negative")
         if ratio > 0:
             ratios[target] = ratio
     if not ratios:
-        raise ValueError("aegis.target_ratios must contain at least one positive ratio")
+        raise ValueError("wildguard.target_ratios must contain at least one positive ratio")
     return ratios
 
 
@@ -418,13 +443,13 @@ def resolve_source_sampling(config: dict[str, Any]) -> dict[str, dict[str, Any]]
         return {
             "safetybench": {"mode": "all"},
             "salad": {"mode": "all"},
-            "aegis": {"mode": "all"},
+            "wildguard": {"mode": "all"},
         }
     if not isinstance(sampling, dict):
         raise ValueError("sampling must be a mapping")
 
     resolved = {}
-    for source in ("safetybench", "salad", "aegis"):
+    for source in ("safetybench", "salad", "wildguard"):
         source_config = sampling.get(source, {"mode": "all"})
         if not isinstance(source_config, dict):
             raise ValueError(f"sampling.{source} must be a mapping")
@@ -487,19 +512,26 @@ def counts_from_sampling(
     return {name: min(count, caps[name]) for name, count in counts.items()}
 
 
-def available_aegis_target_ratios(
+def wildguard_has_label(value: Any) -> bool:
+    return str(value or "").strip().lower() in {"harmful", "unharmful"}
+
+
+def available_wildguard_target_ratios(
     row: dict[str, Any],
     target_ratios: dict[str, float],
 ) -> dict[str, float]:
     prompt = str(row.get("prompt") or "").strip()
     response = str(row.get("response") or "").strip()
+    has_prompt_label = wildguard_has_label(row.get("prompt_harm_label"))
+    has_response_label = wildguard_has_label(row.get("response_harm_label"))
+
     available = {}
     for target, ratio in target_ratios.items():
-        if target == "prompt" and prompt:
+        if target == "prompt" and prompt and has_prompt_label:
             available[target] = ratio
-        elif target == "response" and response:
+        elif target == "response" and response and has_response_label:
             available[target] = ratio
-        elif target == "both" and (prompt or response):
+        elif target == "both" and prompt and has_prompt_label:
             available[target] = ratio
     return available
 
@@ -527,6 +559,23 @@ def resolve_args(args: argparse.Namespace) -> argparse.Namespace:
     resolved.split_metadata_json_string = bool(
         config_get(config, "splits.metadata_json_string", True)
     )
+    resolved.splits_stratify_by_source = bool(
+        config_get(config, "splits.stratify_by_source", True)
+    )
+
+    resolved.quality_deduplicate_prompts = bool(
+        config_get(config, "quality.deduplicate_prompts", True)
+    )
+    resolved.quality_drop_conflicting_prompts = bool(
+        config_get(config, "quality.drop_conflicting_prompts", True)
+    )
+    resolved.quality_require_unique_options = bool(
+        config_get(config, "quality.require_unique_options", True)
+    )
+    resolved.quality_min_options = int(config_get(config, "quality.min_options", 2))
+    resolved.quality_max_options = int(config_get(config, "quality.max_options", 26))
+    if not (2 <= resolved.quality_min_options <= resolved.quality_max_options):
+        raise ValueError("quality option bounds must satisfy 2 <= min_options <= max_options")
 
     resolved.hf_repo_id = str(config_get(config, "huggingface.repo_id", "")).strip()
     resolved.hf_repo_type = str(config_get(config, "huggingface.repo_type", "dataset")).strip()
@@ -555,71 +604,89 @@ def resolve_args(args: argparse.Namespace) -> argparse.Namespace:
     resolved.salad_dataset = str(config_get(config, "salad.dataset", SALAD_DATASET))
     resolved.salad_config = str(config_get(config, "salad.config", SALAD_CONFIG))
     resolved.salad_split = str(config_get(config, "salad.split", SALAD_SPLIT))
-    resolved.aegis_dataset = str(config_get(config, "aegis.dataset", AEGIS_DATASET))
-    resolved.aegis_split = str(config_get(config, "aegis.split", AEGIS_SPLIT))
-    resolved.aegis_target = str(config_get(config, "aegis.target", "prompt"))
-    if resolved.aegis_target not in {"prompt", "response", "both"}:
-        raise ValueError("aegis.target must be one of: prompt, response, both")
-    resolved.aegis_target_ratios = normalize_target_ratios(
-        config_get(config, "aegis.target_ratios"),
-        default_target=resolved.aegis_target,
+    resolved.wildguard_dataset = str(config_get(config, "wildguard.dataset", WILDGUARD_DATASET))
+    resolved.wildguard_config = str(config_get(config, "wildguard.config", WILDGUARD_CONFIG))
+    resolved.wildguard_split = str(config_get(config, "wildguard.split", WILDGUARD_SPLIT))
+    resolved.wildguard_target = str(config_get(config, "wildguard.target", "prompt"))
+    if resolved.wildguard_target not in {"prompt", "response", "both"}:
+        raise ValueError("wildguard.target must be one of: prompt, response, both")
+    resolved.wildguard_target_ratios = normalize_target_ratios(
+        config_get(config, "wildguard.target_ratios"),
+        default_target=resolved.wildguard_target,
     )
 
-    template_file = config_get(config, "aegis.prompt_template_file")
+    template_file = config_get(config, "wildguard.prompt_template_file")
     if template_file is not None:
-        resolved.aegis_prompt_templates = load_prompt_template_jsonl(
+        resolved.wildguard_prompt_templates = load_prompt_template_jsonl(
             resolve_config_path(args.config, template_file),
             {"prompt", "response", "both"},
         )
     else:
-        resolved.aegis_prompt_templates = normalize_prompt_templates(
-            config_get(config, "aegis.prompt_templates")
+        resolved.wildguard_prompt_templates = normalize_prompt_templates(
+            config_get(config, "wildguard.prompt_templates")
         )
-    resolved.aegis_prompt_templates = require_template_targets(
-        resolved.aegis_prompt_templates,
-        resolved.aegis_target_ratios.keys(),
-        label="aegis prompt templates",
+    resolved.wildguard_prompt_templates = require_template_targets(
+        resolved.wildguard_prompt_templates,
+        resolved.wildguard_target_ratios.keys(),
+        label="wildguard prompt templates",
     )
 
-    synonym_file = config_get(config, "aegis.category_synonym_file")
+    synonym_file = config_get(config, "wildguard.category_synonym_file")
     if synonym_file is not None:
         (
-            resolved.aegis_category_synonyms,
-            resolved.aegis_category_aliases,
+            resolved.wildguard_category_synonyms,
+            resolved.wildguard_category_aliases,
         ) = load_category_synonym_jsonl(resolve_config_path(args.config, synonym_file))
     else:
         (
-            resolved.aegis_category_synonyms,
-            resolved.aegis_category_aliases,
-        ) = normalize_category_synonyms(config_get(config, "aegis.category_synonyms"))
+            resolved.wildguard_category_synonyms,
+            resolved.wildguard_category_aliases,
+        ) = normalize_category_synonyms(config_get(config, "wildguard.category_synonyms"))
     missing_synonyms = [
-        category for category in AEGIS_TAXONOMY if category not in resolved.aegis_category_synonyms
+        category for category in WILDGUARD_TAXONOMY if category not in resolved.wildguard_category_synonyms
     ]
     if missing_synonyms:
-        raise ValueError(f"missing Aegis category synonyms: {missing_synonyms}")
-    resolved.aegis_option_count_min = int(config_get(config, "aegis.option_count_min", 3))
-    resolved.aegis_option_count_max = int(config_get(config, "aegis.option_count_max", 22))
-    resolved.aegis_binary_option_ratio = float(config_get(config, "aegis.binary_option_ratio", 0.1))
-    resolved.aegis_binary_unsafe_labels = config_get(
-        config, "aegis.binary_unsafe_labels", ["Unsafe", "Harmful"]
+        raise ValueError(f"missing WildGuard category synonyms: {missing_synonyms}")
+    resolved.wildguard_option_count_min = int(config_get(config, "wildguard.option_count_min", 3))
+    resolved.wildguard_option_count_max = int(config_get(config, "wildguard.option_count_max", 22))
+    resolved.wildguard_option_count_typical_max = int(
+        config_get(
+            config,
+            "wildguard.option_count_typical_max",
+            min(resolved.wildguard_option_count_max, 6),
+        )
     )
-    if isinstance(resolved.aegis_binary_unsafe_labels, str):
-        resolved.aegis_binary_unsafe_labels = [resolved.aegis_binary_unsafe_labels]
-    resolved.aegis_binary_unsafe_labels = [
-        str(label).strip() for label in resolved.aegis_binary_unsafe_labels if str(label).strip()
+    resolved.wildguard_large_option_ratio = float(config_get(config, "wildguard.large_option_ratio", 0.08))
+    resolved.wildguard_binary_option_ratio = float(config_get(config, "wildguard.binary_option_ratio", 0.1))
+    resolved.wildguard_hard_distractor_ratio = float(
+        config_get(config, "wildguard.hard_distractor_ratio", 0.6)
+    )
+    resolved.wildguard_binary_unsafe_labels = config_get(
+        config, "wildguard.binary_unsafe_labels", ["Unsafe", "Harmful"]
+    )
+    if isinstance(resolved.wildguard_binary_unsafe_labels, str):
+        resolved.wildguard_binary_unsafe_labels = [resolved.wildguard_binary_unsafe_labels]
+    resolved.wildguard_binary_unsafe_labels = [
+        str(label).strip() for label in resolved.wildguard_binary_unsafe_labels if str(label).strip()
     ]
-    if not resolved.aegis_binary_unsafe_labels:
-        raise ValueError("aegis.binary_unsafe_labels must contain at least one label")
-    if not (0.0 <= resolved.aegis_binary_option_ratio <= 1.0):
-        raise ValueError("aegis.binary_option_ratio must be between 0 and 1")
+    if not resolved.wildguard_binary_unsafe_labels:
+        raise ValueError("wildguard.binary_unsafe_labels must contain at least one label")
+    if not (0.0 <= resolved.wildguard_binary_option_ratio <= 1.0):
+        raise ValueError("wildguard.binary_option_ratio must be between 0 and 1")
+    if not (0.0 <= resolved.wildguard_hard_distractor_ratio <= 1.0):
+        raise ValueError("wildguard.hard_distractor_ratio must be between 0 and 1")
+    if not (0.0 <= resolved.wildguard_large_option_ratio <= 1.0):
+        raise ValueError("wildguard.large_option_ratio must be between 0 and 1")
     if not (
         2
-        <= resolved.aegis_option_count_min
-        <= resolved.aegis_option_count_max
-        <= len(AEGIS_TAXONOMY)
+        <= resolved.wildguard_option_count_min
+        <= resolved.wildguard_option_count_typical_max
+        <= resolved.wildguard_option_count_max
+        <= len(WILDGUARD_TAXONOMY)
     ):
         raise ValueError(
-            f"aegis option count range must satisfy 2 <= min <= max <= {len(AEGIS_TAXONOMY)}"
+            "wildguard option counts must satisfy "
+            f"2 <= min <= typical_max <= max <= {len(WILDGUARD_TAXONOMY)}"
         )
     return resolved
 
@@ -809,42 +876,46 @@ def canonical_category(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", value.lower())
 
 
-def map_aegis_category(
+def map_wildguard_category(
     label: Any,
-    violated_categories: Any,
+    subcategory: Any,
     *,
     aliases: dict[str, str],
     stats: BuildStats | None = None,
 ) -> str | None:
     label_text = str(label or "").strip().lower()
-    violated_text = str(violated_categories or "").strip()
+    subcategory_text = str(subcategory or "").strip().lower()
 
-    if label_text == "safe":
+    if label_text in {"unharmful", "safe"}:
         return "Safe"
 
-    parts = [part.strip() for part in violated_text.split(",") if part.strip()]
-    if label_text in {"needs caution", "needs_caution", "caution"} and not parts:
-        return "Needs Caution"
-
-    if label_text in {"needs caution", "needs_caution", "caution"}:
-        parts = ["Needs Caution", *parts]
-
-    for part in parts:
-        mapped = aliases.get(canonical_category(part))
-        if mapped:
+    if label_text == "harmful":
+        mapped = WILDGUARD_SUBCATEGORY_MAP.get(subcategory_text)
+        if mapped is None:
+            mapped = aliases.get(canonical_category(subcategory_text))
+        if mapped is not None:
             return mapped
-
-    if label_text in {"unsafe", "needs caution", "needs_caution", "caution"}:
         if stats is not None:
-            stats.skip(f"unmapped_category:{violated_text or label_text}")
+            stats.skip(f"unmapped_subcategory:{subcategory_text or '<empty>'}")
         return None
 
     if stats is not None:
-        stats.skip(f"invalid_label:{label_text or '<empty>'}")
+        stats.skip(f"invalid_harm_label:{label_text or '<empty>'}")
     return None
 
 
-def render_aegis_template(
+def wildguard_hard_distractor_pool(category: str) -> list[str]:
+    pool: list[str] = []
+    for group in WILDGUARD_DISTRACTOR_GROUPS:
+        if category not in group:
+            continue
+        for candidate in group:
+            if candidate != category and candidate not in pool:
+                pool.append(candidate)
+    return pool
+
+
+def render_wildguard_template(
     templates: dict[str, list[str]],
     target: str,
     index: int,
@@ -863,7 +934,7 @@ def render_aegis_template(
     return text, f"{target}:{template_index}"
 
 
-def aegis_problem(
+def wildguard_problem(
     row: dict[str, Any],
     target: str,
     templates: dict[str, list[str]],
@@ -873,46 +944,47 @@ def aegis_problem(
     response = str(row.get("response") or "").strip()
 
     if target == "prompt":
-        if not prompt:
+        if not prompt or not wildguard_has_label(row.get("prompt_harm_label")):
             return None, None, None
-        text, template_id = render_aegis_template(
+        text, template_id = render_wildguard_template(
             templates, target, index, prompt=prompt, response=response
         )
-        return text, row.get("prompt_label"), template_id
+        return text, row.get("prompt_harm_label"), template_id
 
     if target == "response":
-        if not response:
+        if not response or not wildguard_has_label(row.get("response_harm_label")):
             return None, None, None
-        text, template_id = render_aegis_template(
+        text, template_id = render_wildguard_template(
             templates, target, index, prompt=prompt, response=response
         )
-        return text, row.get("response_label"), template_id
+        return text, row.get("response_harm_label"), template_id
 
-    if not prompt and not response:
+    if not prompt or not wildguard_has_label(row.get("prompt_harm_label")):
         return None, None, None
 
-    text, template_id = render_aegis_template(
+    text, template_id = render_wildguard_template(
         templates, target, index, prompt=prompt, response=response
     )
-    # For a combined interaction, prefer an unsafe/needs-caution response label
-    # when present; otherwise classify the prompt.
-    response_label = str(row.get("response_label") or "").strip().lower()
-    if response_label and response_label != "safe":
-        return text, row.get("response_label"), template_id
-    return text, row.get("prompt_label"), template_id
+    response_label = row.get("response_harm_label")
+    if response and wildguard_has_label(response_label) and str(response_label).lower() == "harmful":
+        return text, response_label, template_id
+    return text, row.get("prompt_harm_label"), template_id
 
 
-def build_aegis_options(
+def build_wildguard_options(
     category: str,
     *,
     synonyms: dict[str, list[str]],
     seed: str,
     option_count_min: int,
+    option_count_typical_max: int,
     option_count_max: int,
     binary_option_ratio: float,
     binary_unsafe_labels: list[str],
+    hard_distractor_ratio: float,
+    large_option_ratio: float,
 ) -> tuple[list[str], int, list[str], str]:
-    """Build variable Aegis MCQ options while always including the correct label."""
+    """Build variable WildGuard MCQ options while always including the correct label."""
 
     rng = random.Random(seed)
     if rng.random() < binary_option_ratio:
@@ -921,12 +993,25 @@ def build_aegis_options(
         answer_index = 0 if category == "Safe" else 1
         return options, answer_index, option_categories, "binary"
 
-    count = rng.randint(option_count_min, option_count_max)
-    distractor_pool = [candidate for candidate in AEGIS_TAXONOMY if candidate != category]
-    option_categories = [category] + rng.sample(
-        distractor_pool,
-        k=min(count - 1, len(distractor_pool)),
-    )
+    if rng.random() < large_option_ratio and option_count_typical_max < option_count_max:
+        count = rng.randint(option_count_typical_max + 1, option_count_max)
+    else:
+        count = rng.randint(option_count_min, option_count_typical_max)
+
+    needed = count - 1
+    distractor_pool = [candidate for candidate in WILDGUARD_TAXONOMY if candidate != category]
+    hard_pool = [
+        candidate
+        for candidate in wildguard_hard_distractor_pool(category)
+        if candidate in distractor_pool
+    ]
+    hard_count = min(len(hard_pool), int(round(needed * hard_distractor_ratio)))
+    distractors = rng.sample(hard_pool, k=hard_count) if hard_count else []
+    remaining_pool = [candidate for candidate in distractor_pool if candidate not in distractors]
+    remaining_needed = min(needed - len(distractors), len(remaining_pool))
+    distractors.extend(rng.sample(remaining_pool, k=remaining_needed))
+
+    option_categories = [category] + distractors
     rng.shuffle(option_categories)
     answer_index = option_categories.index(category)
     options = [
@@ -936,8 +1021,9 @@ def build_aegis_options(
     return options, answer_index, option_categories, "category"
 
 
-def normalize_aegis(
+def normalize_wildguard(
     dataset_name: str,
+    config: str,
     split: str,
     *,
     target_ratios: dict[str, float],
@@ -945,32 +1031,36 @@ def normalize_aegis(
     category_synonyms: dict[str, list[str]],
     category_aliases: dict[str, str],
     option_count_min: int,
+    option_count_typical_max: int,
     option_count_max: int,
     binary_option_ratio: float,
     binary_unsafe_labels: list[str],
+    hard_distractor_ratio: float,
+    large_option_ratio: float,
     shuffle_options: bool = True,
     seed: int = 42,
     answer_format: str = "plain",
 ) -> tuple[list[dict[str, Any]], BuildStats]:
     load_dataset = require_datasets()
-    dataset = load_dataset(dataset_name, split=split)
+    dataset = load_dataset(dataset_name, config, split=split)
     stats = BuildStats(loaded=len(dataset))
     target_pools: dict[str, list[dict[str, Any]]] = {target: [] for target in target_ratios}
 
     for index, row in enumerate(dataset):
-        available_ratios = available_aegis_target_ratios(row, target_ratios)
+        available_ratios = available_wildguard_target_ratios(row, target_ratios)
         if not available_ratios:
             stats.skip("missing_text")
             continue
 
         for target in available_ratios:
-            problem, label, template_id = aegis_problem(row, target, prompt_templates, index)
+            problem, label, template_id = wildguard_problem(row, target, prompt_templates, index)
             if not problem:
                 continue
 
-            category = map_aegis_category(
+            subcategory = row.get("subcategory")
+            category = map_wildguard_category(
                 label,
-                row.get("violated_categories"),
+                subcategory,
                 aliases=category_aliases,
                 stats=stats,
             )
@@ -979,20 +1069,23 @@ def normalize_aegis(
 
             source_key = row.get("id") or index
             target_key = f"{source_key}:{target}"
-            options, answer_index, option_categories, option_mode = build_aegis_options(
+            options, answer_index, option_categories, option_mode = build_wildguard_options(
                 category,
                 synonyms=category_synonyms,
-                seed=option_order_seed(seed, "aegis-options", target_key),
+                seed=option_order_seed(seed, "wildguard-options", target_key),
                 option_count_min=option_count_min,
+                option_count_typical_max=option_count_typical_max,
                 option_count_max=option_count_max,
                 binary_option_ratio=binary_option_ratio,
                 binary_unsafe_labels=binary_unsafe_labels,
+                hard_distractor_ratio=hard_distractor_ratio,
+                large_option_ratio=large_option_ratio,
             )
             shuffled_options, shuffled_answer_index, option_order = maybe_shuffle_options(
                 options,
                 answer_index,
                 enabled=shuffle_options,
-                seed=option_order_seed(seed, "aegis-shuffle", target_key),
+                seed=option_order_seed(seed, "wildguard-shuffle", target_key),
             )
             answer_label = index_to_label(shuffled_answer_index)
             shuffled_option_categories = [
@@ -1002,7 +1095,7 @@ def normalize_aegis(
                 {
                     "prompt": build_prompt(problem, shuffled_options),
                     "answer": format_answer(answer_label, answer_format),
-                    "source": "aegis",
+                    "source": "wildguard",
                     "metadata": {
                         "source_dataset": dataset_name,
                         "source_index": index,
@@ -1015,10 +1108,12 @@ def normalize_aegis(
                         "answer_index": answer_index,
                         "shuffled_answer_index": shuffled_answer_index,
                         "option_order_original_indices": option_order,
-                        "prompt_label": row.get("prompt_label"),
-                        "response_label": row.get("response_label"),
-                        "violated_categories": row.get("violated_categories"),
+                        "prompt_harm_label": row.get("prompt_harm_label"),
+                        "response_harm_label": row.get("response_harm_label"),
+                        "response_refusal_label": row.get("response_refusal_label"),
+                        "subcategory": subcategory,
                         "dataset": dataset_name,
+                        "config": config,
                         "split": split,
                     },
                 }
@@ -1086,14 +1181,106 @@ def max_balanced_total(ratios: dict[str, float], caps: dict[str, int]) -> int:
 
 
 def option_labels_in_prompt(prompt: str) -> set[str]:
-    return set(re.findall(r"(?m)^([A-Z]+)\) ", prompt))
+    return {label for label, _ in parse_prompt_options(prompt)}
 
 
 def answer_label(answer: str) -> str | None:
+    answer = answer.strip().upper()
     if re.fullmatch(r"[A-Z]+", answer):
         return answer
-    match = re.fullmatch(r"\\boxed\{([A-Z]+)\}", answer)
+    match = re.fullmatch(r"\\BOXED\{\s*([A-Z]+)\s*\}", answer)
     return match.group(1) if match else None
+
+
+def normalized_quality_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value).strip()).casefold()
+
+
+def parse_prompt_options(prompt: str) -> list[tuple[str, str]]:
+    return [
+        (match.group(1).upper(), match.group(2).strip())
+        for match in re.finditer(r"(?m)^([A-Z]+)\)\s*(.*)$", prompt)
+    ]
+
+
+def prompt_problem_text(prompt: str) -> str:
+    match = re.search(r"(?m)^[A-Z]+\)\s*", prompt)
+    if not match:
+        return prompt
+    return prompt[: match.start()]
+
+
+def prompt_dedup_key(prompt: str) -> str:
+    options = parse_prompt_options(prompt)
+    option_texts = sorted(normalized_quality_text(text) for _, text in options)
+    return "||".join([normalized_quality_text(prompt_problem_text(prompt)), *option_texts])
+
+
+def answer_option_key(example: dict[str, Any]) -> str:
+    label = answer_label(str(example.get("answer", "")))
+    options = dict(parse_prompt_options(str(example.get("prompt", ""))))
+    if label in options:
+        return normalized_quality_text(options[label])
+    return str(label or "")
+
+
+def quality_filter_examples(
+    examples: list[dict[str, Any]],
+    *,
+    deduplicate_prompts: bool,
+    drop_conflicting_prompts: bool,
+    require_unique_options: bool,
+    min_options: int,
+    max_options: int,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    stats: Counter[str] = Counter(input=len(examples))
+    candidates: list[dict[str, Any]] = []
+
+    for example in examples:
+        prompt = str(example.get("prompt", ""))
+        options = parse_prompt_options(prompt)
+        labels = {label for label, _ in options}
+        label = answer_label(str(example.get("answer", "")))
+
+        if len(options) < min_options:
+            stats["too_few_options"] += 1
+            continue
+        if len(options) > max_options:
+            stats["too_many_options"] += 1
+            continue
+        if not label or label not in labels:
+            stats["answer_not_in_options"] += 1
+            continue
+        if require_unique_options:
+            option_keys = [normalized_quality_text(text) for _, text in options]
+            if len(set(option_keys)) != len(option_keys):
+                stats["duplicate_option_text"] += 1
+                continue
+
+        candidates.append(example)
+
+    if not deduplicate_prompts:
+        stats["kept"] = len(candidates)
+        return candidates, dict(stats)
+
+    groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for example in candidates:
+        groups[prompt_dedup_key(str(example["prompt"]))].append(example)
+
+    filtered: list[dict[str, Any]] = []
+    for group in groups.values():
+        answer_keys = {answer_option_key(example) for example in group}
+        if len(answer_keys) > 1:
+            stats["conflicting_duplicate_prompts"] += len(group)
+            if drop_conflicting_prompts:
+                continue
+
+        filtered.append(group[0])
+        if len(group) > 1:
+            stats["duplicate_prompts_removed"] += len(group) - 1
+
+    stats["kept"] = len(filtered)
+    return filtered, dict(stats)
 
 
 def validate_examples(examples: list[dict[str, Any]]) -> None:
@@ -1169,8 +1356,30 @@ def write_output_jsonl(
 def split_examples(
     examples: list[dict[str, Any]],
     ratios: dict[str, float],
-    seed: int,
+    seed: int | str,
+    *,
+    stratify_by_source: bool = False,
 ) -> dict[str, list[dict[str, Any]]]:
+    if stratify_by_source:
+        splits: dict[str, list[dict[str, Any]]] = {name: [] for name in ratios}
+        groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for example in examples:
+            groups[str(example.get("source", "unknown"))].append(example)
+
+        for source, rows in sorted(groups.items()):
+            source_splits = split_examples(
+                rows,
+                ratios,
+                f"{seed}:{source}",
+                stratify_by_source=False,
+            )
+            for split, split_rows in source_splits.items():
+                splits[split].extend(split_rows)
+
+        for split, rows in splits.items():
+            random.Random(f"{seed}:{split}:shuffle").shuffle(rows)
+        return splits
+
     counts = allocate_counts(len(examples), ratios, strict=True)
     shuffled = list(examples)
     random.Random(seed).shuffle(shuffled)
@@ -1190,6 +1399,7 @@ def split_summary(
     ratios: dict[str, float],
     output_dir: Path,
     metadata_json_string: bool,
+    stratify_by_source: bool,
 ) -> dict[str, Any]:
     return {
         "output_dir": str(output_dir),
@@ -1197,6 +1407,7 @@ def split_summary(
         "ratios": ratios,
         "total": sum(len(rows) for rows in splits.values()),
         "metadata_json_string": metadata_json_string,
+        "stratify_by_source": stratify_by_source,
         "splits": {
             name: {
                 "rows": len(rows),
@@ -1236,7 +1447,7 @@ configs:
 # MCQ Safety
 
 Merged safety multiple-choice dataset built from SafetyBench test-en, SALAD
-Bench MCQ data, and Aegis 2.0 safety category data.
+Bench MCQ data, and WildGuardMix harm-category data.
 
 ## Splits
 
@@ -1267,8 +1478,14 @@ def write_split_files(
     include_source: bool,
     include_metadata: bool,
     metadata_json_string: bool,
+    stratify_by_source: bool = False,
 ) -> dict[str, Any]:
-    splits = split_examples(examples, ratios, seed)
+    splits = split_examples(
+        examples,
+        ratios,
+        seed,
+        stratify_by_source=stratify_by_source,
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
 
     for split, rows in splits.items():
@@ -1286,6 +1503,7 @@ def write_split_files(
         ratios=ratios,
         output_dir=output_dir,
         metadata_json_string=metadata_json_string,
+        stratify_by_source=stratify_by_source,
     )
     (output_dir / "split_summary.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False),
@@ -1405,34 +1623,45 @@ def run_self_test() -> None:
     )
 
     stats = BuildStats()
-    test_synonyms = {category: [category] for category in AEGIS_TAXONOMY}
-    test_synonyms["Violence"] = ["Violence", "Violent Harm"]
-    test_aliases = {canonical_category(category): category for category in AEGIS_TAXONOMY}
-    assert map_aegis_category("safe", "", aliases=test_aliases, stats=stats) == "Safe"
+    test_synonyms = {category: [category] for category in WILDGUARD_TAXONOMY}
+    test_synonyms["Violence and Physical Harm"] = ["Violence and Physical Harm", "Violent Harm"]
+    test_aliases = {canonical_category(category): category for category in WILDGUARD_TAXONOMY}
+    assert map_wildguard_category("unharmful", "benign", aliases=test_aliases, stats=stats) == "Safe"
     assert (
-        map_aegis_category("unsafe", "Violence, Needs Caution", aliases=test_aliases, stats=stats)
-        == "Violence"
+        map_wildguard_category(
+            "harmful",
+            "violence_and_physical_harm",
+            aliases=test_aliases,
+            stats=stats,
+        )
+        == "Violence and Physical Harm"
     )
-    sampled_options, sampled_answer, sampled_categories, sampled_mode = build_aegis_options(
-        "Violence",
+    sampled_options, sampled_answer, sampled_categories, sampled_mode = build_wildguard_options(
+        "Violence and Physical Harm",
         synonyms=test_synonyms,
         seed="sampled-options",
         option_count_min=3,
-        option_count_max=5,
+        option_count_typical_max=5,
+        option_count_max=15,
         binary_option_ratio=0.0,
         binary_unsafe_labels=["Unsafe"],
+        hard_distractor_ratio=0.75,
+        large_option_ratio=0.0,
     )
     assert sampled_mode == "category"
     assert 3 <= len(sampled_options) <= 5
-    assert sampled_categories[sampled_answer] == "Violence"
-    binary_options, binary_answer, binary_categories, binary_mode = build_aegis_options(
-        "Violence",
+    assert sampled_categories[sampled_answer] == "Violence and Physical Harm"
+    binary_options, binary_answer, binary_categories, binary_mode = build_wildguard_options(
+        "Violence and Physical Harm",
         synonyms=test_synonyms,
         seed="binary-options",
         option_count_min=3,
-        option_count_max=5,
+        option_count_typical_max=5,
+        option_count_max=15,
         binary_option_ratio=1.0,
         binary_unsafe_labels=["Unsafe"],
+        hard_distractor_ratio=0.75,
+        large_option_ratio=0.0,
     )
     assert binary_mode == "binary"
     assert binary_options == ["Safe", "Unsafe"] or binary_options[1] == "Unsafe"
@@ -1448,7 +1677,7 @@ def run_self_test() -> None:
     assert same == ["a", "b", "c"]
     assert same_answer == 1
     assert same_order == [0, 1, 2]
-    rendered, template_id = render_aegis_template(
+    rendered, template_id = render_wildguard_template(
         {
             "prompt": ["Template one: {prompt}", "Template two: {prompt}"],
             "response": ["Response: {response}"],
@@ -1462,11 +1691,11 @@ def run_self_test() -> None:
     assert rendered == "Template two: hello"
     assert template_id == "prompt:1"
     assert allocate_counts(
-        10, {"safetybench": 0.4, "salad": 0.3, "aegis": 0.3}
-    ) == {"safetybench": 4, "salad": 3, "aegis": 3}
+        10, {"safetybench": 0.4, "salad": 0.3, "wildguard": 0.3}
+    ) == {"safetybench": 4, "salad": 3, "wildguard": 3}
     assert allocate_counts(
-        30, {"safetybench": 0.4, "salad": 0.3, "aegis": 0.3}
-    ) == {"safetybench": 12, "salad": 9, "aegis": 9}
+        30, {"safetybench": 0.4, "salad": 0.3, "wildguard": 0.3}
+    ) == {"safetybench": 12, "salad": 9, "wildguard": 9}
     assert allocate_counts(
         10, {"train": 0.8, "valid": 0.1, "test": 0.1}
     ) == {"train": 8, "valid": 1, "test": 1}
@@ -1481,6 +1710,16 @@ def run_self_test() -> None:
         for index in range(10)
     ]
     validate_examples(unit_examples)
+    filtered_unit_examples, quality_stats = quality_filter_examples(
+        unit_examples + [dict(unit_examples[0])],
+        deduplicate_prompts=True,
+        drop_conflicting_prompts=True,
+        require_unique_options=True,
+        min_options=2,
+        max_options=26,
+    )
+    assert len(filtered_unit_examples) == len(unit_examples)
+    assert quality_stats["duplicate_prompts_removed"] == 1
     unit_splits = split_examples(unit_examples, {"train": 0.8, "valid": 0.1, "test": 0.1}, 42)
     assert {name: len(rows) for name, rows in unit_splits.items()} == {
         "train": 8,
@@ -1521,17 +1760,21 @@ def build_dataset(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[
         seed=args.seed,
         answer_format=args.answer_format,
     )
-    aegis, aegis_stats = normalize_aegis(
-        args.aegis_dataset,
-        args.aegis_split,
-        target_ratios=args.aegis_target_ratios,
-        prompt_templates=args.aegis_prompt_templates,
-        category_synonyms=args.aegis_category_synonyms,
-        category_aliases=args.aegis_category_aliases,
-        option_count_min=args.aegis_option_count_min,
-        option_count_max=args.aegis_option_count_max,
-        binary_option_ratio=args.aegis_binary_option_ratio,
-        binary_unsafe_labels=args.aegis_binary_unsafe_labels,
+    wildguard, wildguard_stats = normalize_wildguard(
+        args.wildguard_dataset,
+        args.wildguard_config,
+        args.wildguard_split,
+        target_ratios=args.wildguard_target_ratios,
+        prompt_templates=args.wildguard_prompt_templates,
+        category_synonyms=args.wildguard_category_synonyms,
+        category_aliases=args.wildguard_category_aliases,
+        option_count_min=args.wildguard_option_count_min,
+        option_count_typical_max=args.wildguard_option_count_typical_max,
+        option_count_max=args.wildguard_option_count_max,
+        binary_option_ratio=args.wildguard_binary_option_ratio,
+        binary_unsafe_labels=args.wildguard_binary_unsafe_labels,
+        hard_distractor_ratio=args.wildguard_hard_distractor_ratio,
+        large_option_ratio=args.wildguard_large_option_ratio,
         shuffle_options=args.shuffle_options,
         seed=args.seed,
         answer_format=args.answer_format,
@@ -1540,7 +1783,7 @@ def build_dataset(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[
     sources = {
         "safetybench": safetybench,
         "salad": salad,
-        "aegis": aegis,
+        "wildguard": wildguard,
     }
     counts = counts_from_sampling(
         sources,
@@ -1548,12 +1791,22 @@ def build_dataset(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[
         strict=args.strict,
     )
     full_examples = sample_and_merge(sources, counts, args.seed)
+    configured_total = len(full_examples)
+    full_examples, quality_stats = quality_filter_examples(
+        full_examples,
+        deduplicate_prompts=args.quality_deduplicate_prompts,
+        drop_conflicting_prompts=args.quality_drop_conflicting_prompts,
+        require_unique_options=args.quality_require_unique_options,
+        min_options=args.quality_min_options,
+        max_options=args.quality_max_options,
+    )
     examples = sample_final_examples(full_examples, args.samples, args.seed, strict=args.strict)
     validate_examples(examples)
 
     stats = {
         "requested_samples": args.samples,
-        "configured_total": len(full_examples),
+        "configured_total": configured_total,
+        "post_quality_total": len(full_examples),
         "actual_total": len(examples),
         "seed": args.seed,
         "config": str(args.config),
@@ -1562,18 +1815,23 @@ def build_dataset(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[
         "include_source": args.include_source,
         "include_metadata": args.include_metadata,
         "source_sampling": args.source_sampling,
-        "aegis_target_ratios": args.aegis_target_ratios,
-        "aegis_option_count_range": [
-            args.aegis_option_count_min,
-            args.aegis_option_count_max,
+        "wildguard_config": args.wildguard_config,
+        "wildguard_target_ratios": args.wildguard_target_ratios,
+        "wildguard_option_count_range": [
+            args.wildguard_option_count_min,
+            args.wildguard_option_count_max,
         ],
-        "aegis_binary_option_ratio": args.aegis_binary_option_ratio,
+        "wildguard_option_count_typical_max": args.wildguard_option_count_typical_max,
+        "wildguard_binary_option_ratio": args.wildguard_binary_option_ratio,
+        "wildguard_hard_distractor_ratio": args.wildguard_hard_distractor_ratio,
+        "wildguard_large_option_ratio": args.wildguard_large_option_ratio,
+        "quality": quality_stats,
         "counts": dict(Counter(example["source"] for example in examples)),
         "target_counts": counts,
         "source_stats": {
             "safetybench": safetybench_stats.as_dict(),
             "salad": salad_stats.as_dict(),
-            "aegis": aegis_stats.as_dict(),
+            "wildguard": wildguard_stats.as_dict(),
         },
     }
     return examples, stats
@@ -1656,6 +1914,7 @@ def main(argv: list[str] | None = None) -> int:
             include_source=args.include_source,
             include_metadata=args.include_metadata,
             metadata_json_string=args.split_metadata_json_string,
+            stratify_by_source=args.splits_stratify_by_source,
         )
 
     if args.hf_upload or args.hf_dry_run:
